@@ -1,0 +1,972 @@
+---
+title: "Predicting Changes in Annual Reports using R"
+date: "`r Sys.Date()`"
+output:
+  tufte::tufte_html: 
+    tufte_variant: "default"
+    self_contained: yes
+---
+Load all the relevant Libraries
+```{r setup, include=FALSE}
+# setup is just a name for the section
+# include=FALSE specifies to not print this into the document
+library(tufte)
+library(funModeling) 
+library(tidyverse) 
+library(lubridate)
+library("tidyr", "dplyr")
+library(Metrics)
+library(broom) 
+library(xgboost)
+library(data.table)
+library(mltools)
+library(caret)
+library(coefplot)
+library(glmnet)
+library(ROCR)
+library(boot)
+```
+
+Loading the training, testing, compustat, 10k scrapped fog and sentiment data
+```{R Step 1, eval=TRUE}
+traindf <- read.csv("10K_Changes_train.csv")
+testdf <- read.csv("10K_Changes_test.csv")
+ext_data <- read.csv("Var_Inputs_v4c.csv")
+fogdf <- read.csv("corp_FOG.csv")
+sentidf <- read.csv("sentiment2.csv")
+```
+
+Checking if traindf and testdf have the same unique gvkey to check for completeness
+```{R Step 2, eval=TRUE}
+traindf$gvkey <- as.numeric(traindf$gvkey)
+testdf$gvkey <- as.numeric(testdf$gvkey)
+
+df1 <- distinct(traindf, gvkey)
+df2 <- distinct(testdf, gvkey)
+
+df3 <- inner_join(df1, df2, by = 'gvkey')
+distinct(df3, gvkey)
+
+# Comment: Team concludes that both training and testing data have the same unique 1040 gvkey
+```
+
+Converting the scraped text annual report for Sentiment analysis (Do not run this code. This code has been run for you, the file name is sentiment2.csv)
+```{R Step 3, eval=FALSE}
+library(tidytext)
+library(glue)
+library(stringr)
+library(stopwords)
+
+stop_SMART <- stopwords(source = "smart")
+stop_en <- stopwords("english")
+
+# get a list of the files in the input directory
+files <- list.files("C:/Users/USER/Desktop/Project SEC Scrap/Testing Sentiment")
+
+# write a function that takes the name of a file and returns the # of postive
+# sentiment words, negative sentiment words, the difference & the normalized difference
+GetSentiment <- function(file){
+  # get the file
+  fileName <- glue("C:/Users/USER/Desktop/Project SEC Scrap/Testing Sentiment/", file, sep = "")
+  # get rid of any sneaky trailing spaces
+  fileName <- trimws(fileName)
+  
+  # read in the new file
+  fileText <- glue(read_file(fileName))
+  # remove any dollar signs (they're special characters in R)
+  fileText <- gsub("\\$", "", fileText) 
+  
+  # tokenize
+  tokens <- data_frame(text = fileText) %>% unnest_tokens(word, text)
+  
+  # get the sentiment from the first text: 
+  sentiment <- tokens %>%
+    anti_join(data.frame(word = stop_SMART))%>%
+    anti_join(data.frame(word = stop_en))%>%
+    inner_join(get_sentiments("loughran")) %>% # pull out only sentimen words
+    count(sentiment) %>%
+    spread(sentiment, n, fill = 0) %>% # made data wide rather than narrow
+    select(constraining, litigious, negative, positive,
+           uncertainty) %>%
+    mutate(file = file) # add the name of our file
+
+    
+  # return our sentiment dataframe
+  return(sentiment)
+}
+
+# file to put our output in
+sentiments <- data_frame()
+
+# get the sentiments for each file in our datset
+for(i in files){
+  sentiments <- rbind(sentiments, GetSentiment(i))
+}
+
+sentiments <- sentiments %>%
+  group_by(file) %>%
+  mutate(total = sum(constraining, litigious, negative, positive, superfluous, uncertainty),
+         constraining = constraining/total,
+         litigious = litigious/total,
+         negative = negative/total,
+         positive = positive/total,
+         superfluous = superfluous/total,
+         uncertainty = uncertainty/total) %>%
+  subset(select = -total)
+
+write.csv(sentiments, "sentiment2.csv")
+
+```
+
+Getting the FOG index from the scrapped 10k data (Do not run this code as we did not include all four thousands over the scraped version of the text annual report. This code has been run for you, the file name is corp_FOG.csv)
+```{R Step 4, eval=FALSE}
+corp <- corpus(readtext("*.txt"))
+corp_FOG <- textstat_readability(corp, "FOG")
+View(corp_FOG)
+
+write.csv(corp_FOG,"C:\\Users\\USER\\Desktop\\corp_FOG.csv")
+
+```
+
+Checking the compustat, FOG and Sentiment data if they have the same number of unique GV Key. 
+Team notes that the FOG and Sentiment Data has 908 instance of unique GVkey and this is due to the limitation of the scrapped 10k. We did our best to scrap the data to the best of our abilities. 
+```{R Step 5, eval=TRUE}
+#compustat data
+df4 <- distinct(ext_data, gvkey)
+
+#FOG analysis data
+distinct(fogdf, CIK)
+fogdf$periodyear <- as.integer(fogdf$periodyear)
+fogdf <- fogdf %>% arrange(CIK, periodyear) %>%
+  group_by(CIK) %>%
+  mutate(percent_change_fog = FOG/lag(FOG)-1) %>%
+  ungroup()
+#Note: Codes above managed to scrap only 908 unique GVkey in step 3 above
+
+#Sentiment Data
+distinct(sentidf, CIK)
+sentidf$periodyear <- as.integer(sentidf$periodyear)
+#Note: Codes above managed to scrap only 908 unique GVkey in step 3 above
+```
+
+Preparing the training, testing and external data type for merging 
+```{R Step 6, eval=TRUE}
+
+ext_data <- ext_data%>%
+  mutate(periodyear = year(ymd(ext_data$datadate)))%>%
+  arrange(gvkey)
+
+traindf <- traindf %>%
+  mutate(periodyear = year(ymd(traindf$period_date)))
+
+testdf <- testdf %>%
+  mutate(periodyear = year(ymd(testdf$period_date)))
+
+```
+
+Setting up function for EDA and describing the compustat data for to have a general sense of the compustat data
+```{R Step 7, eval=TRUE}
+#EDA
+basic_eda <- function(df)
+{
+  glimpse(df)
+  print(status(df))
+  freq(df) 
+  print(profiling_num(df))
+  plot_num(df)
+  describe(df)
+}
+describe(ext_data)
+```
+
+Features engineering for variables that we think are significant to run our models
+```{R Step 8, eval=TRUE}
+
+# Impute Accounting Standard Changes variable based on if negative or above zero = 1, else = 0
+ext_data <- ext_data %>% mutate("acchgI" = ifelse(ext_data$acchg < 0 | ext_data$acchg > 0 ,"Y","N"))
+
+# Impute Market Value column based on > 1billion = Large cap, 100m to 1billion = medium cap, else = small cap
+ext_data$mkvaltI  <- cut(ext_data$mkvalt, c(-Inf,100,1000,Inf), c("SC", "MC", "LC"))
+
+# Impute Type of Auditor column based on Unaudited = 0, Big Four = 1 to 8 and Mid Tier = 9 to 27 
+ext_data$auI  <- cut(ext_data$au, c(-Inf,0.5,8.5,Inf), c("UA", "BF", "MT"))
+
+# Impute Audit Opinion column based on Unqualified = 1, Big Four = Unqualified_add 
+ext_data$auopI  <- cut(ext_data$auop, c(-Inf,0.5,1.5,Inf), c("UA", "UQ", "UQA"))
+
+# percentage change variable for Total Assets
+ext_data <- ext_data %>% arrange(gvkey, periodyear) %>%
+                    group_by(gvkey) %>%
+                    mutate(percent_change_at = at/lag(at)-1) %>%
+                    ungroup()
+
+# percentage change variable for Common Shares Outstanding
+ext_data <- ext_data %>% arrange(gvkey, periodyear) %>%
+                    group_by(gvkey) %>%
+                    mutate(percent_change_csho = csho/lag(csho)-1) %>%
+                    ungroup()
+
+# percentage change variable for Discontinued Operations
+ext_data <- ext_data %>% arrange(gvkey, periodyear) %>%
+                    group_by(gvkey) %>%
+                    mutate(percent_change_do = do/lag(do)-1) %>%
+                    ungroup()
+
+# percentage change variable for Goodwill
+ext_data <- ext_data %>% arrange(gvkey, periodyear) %>%
+                    group_by(gvkey) %>%
+                    mutate(percent_change_gdwl = gdwl/lag(gdwl)-1) %>%
+                    ungroup()
+
+# percentage change variable for Gross Profit
+ext_data <- ext_data %>% arrange(gvkey, periodyear) %>%
+                    group_by(gvkey) %>%
+                    mutate(percent_change_gp = gp/lag(gp)-1) %>%
+                    ungroup()
+
+# percentage change variable for Total Liabilities 
+ext_data <- ext_data %>% arrange(gvkey, periodyear) %>%
+                    group_by(gvkey) %>%
+                    mutate(percent_change_lt = lt/lag(lt)-1) %>%
+                    ungroup()
+
+# percentage change variable for Net Income 
+ext_data <- ext_data %>% arrange(gvkey, periodyear) %>%
+                    group_by(gvkey) %>%
+                    mutate(percent_change_ni = ni/lag(ni)-1) %>%
+                    ungroup()
+
+# percentage change variable for Non Operating Income
+ext_data <- ext_data %>% arrange(gvkey, periodyear) %>%
+                    group_by(gvkey) %>%
+                    mutate(percent_change_nopi = nopi/lag(nopi)-1) %>%
+                    ungroup()
+
+# percentage change variable for Total Revenue
+ext_data <- ext_data %>% arrange(gvkey, periodyear) %>%
+                    group_by(gvkey) %>%
+                    mutate(percent_change_revt = revt/lag(revt)-1) %>%
+                    ungroup()
+
+# percentage change variable for Litigation Settlement
+ext_data <- ext_data %>% arrange(gvkey, periodyear) %>%
+                    group_by(gvkey) %>%
+                    mutate(percent_change_seta = seta/lag(seta)-1) %>%
+                    ungroup()
+
+# percentage change variable for Sale of Investment
+ext_data <- ext_data %>% arrange(gvkey, periodyear) %>%
+                    group_by(gvkey) %>%
+                    mutate(percent_change_siv = siv/lag(siv)-1) %>%
+                    ungroup()
+
+# percentage change variable for Total Shareholders Equity
+ext_data <- ext_data %>% arrange(gvkey, periodyear) %>%
+                    group_by(gvkey) %>%
+                    mutate(percent_change_teq = teq/lag(teq)-1) %>%
+                    ungroup()
+
+# percentage change variable for Writedown/Impairement
+ext_data <- ext_data %>% arrange(gvkey, periodyear) %>%
+                    group_by(gvkey) %>%
+                    mutate(percent_change_wda = wda/lag(wda)-1) %>%
+                    ungroup()
+
+# percentage change variable for Constraint sentiment
+sentidf <- sentidf %>% arrange(CIK, periodyear) %>%
+                    group_by(CIK) %>%
+                    mutate(percent_con_total = con_total/lag(con_total)-1) %>%
+                    ungroup()
+
+# percentage change variable for litigious sentiment
+sentidf <- sentidf %>% arrange(CIK, periodyear) %>%
+                    group_by(CIK) %>%
+                    mutate(percent_lit_total = lit_total/lag(lit_total)-1) %>%
+                    ungroup()
+
+# percentage change variable for negative sentiment
+sentidf <- sentidf %>% arrange(CIK, periodyear) %>%
+                    group_by(CIK) %>%
+                    mutate(percent_neg_total = neg_total/lag(neg_total)-1) %>%
+                    ungroup()
+
+# percentage change variable for positive sentiment
+sentidf <- sentidf %>% arrange(CIK, periodyear) %>%
+                    group_by(CIK) %>%
+                    mutate(percent_pos_total = pos_total/lag(pos_total)-1) %>%
+                    ungroup()
+
+# percentage change variable for superfluous sentiment
+sentidf <- sentidf %>% arrange(CIK, periodyear) %>%
+                    group_by(CIK) %>%
+                    mutate(percent_sup_total = sup_total/lag(sup_total)-1) %>%
+                    ungroup()
+
+# percentage change variable for uncertain sentiment
+sentidf <- sentidf %>% arrange(CIK, periodyear) %>%
+                    group_by(CIK) %>%
+                    mutate(percent_uncertain_total = uncertain_total/lag(uncertain_total)-1) %>%
+                    ungroup()
+
+# Replaces NaN, Inf, and -Inf with 0 for all numeric variables above
+ext_data <- ext_data %>%
+  mutate_if(is.numeric, funs(replace(., !is.finite(.), 0)))
+
+```
+
+Change the mutated column that are non numeric into character type for encoding later
+```{R Step 9, eval=TRUE}
+#Change dtype to char
+ext_data$mkvaltI <- as.character(ext_data$mkvaltI)
+ext_data$auI <- as.character(ext_data$auI)
+ext_data$auopI <- as.character(ext_data$auopI)
+
+```
+
+Combining the external data (i.e. Compustat, FOG and Sentiment) with training data
+```{R Step 10, eval=TRUE}
+
+#Combine FOG and training using CIK and period year by right-join because not all Gvkey are present in the FOG data
+traindf <- right_join(fogdf, traindf, by = c("CIK","periodyear"))
+traindf <- traindf %>%
+  mutate_if(is.numeric, funs(replace(., !is.finite(.), 0)))
+
+
+#Combine sentiment and training using CIK and period year by right-join because not all Gvkey are present in the sentiment data
+traindf <- right_join(sentidf, traindf, by = c("CIK","periodyear"))
+traindf <- traindf %>%
+  mutate_if(is.numeric, funs(replace(., !is.finite(.), 0)))
+
+#combine compustat and training by inner join  
+train_combined <- inner_join(ext_data, traindf, by = c("gvkey","periodyear"))
+df5 <- distinct(train_combined, gvkey)
+
+```
+
+Combining the external data (i.e. Compustat, FOG and Sentiment) with testing data
+```{R Step 11, eval=TRUE}
+#Combine FOG and testing using CIK and period year by right-join because not all Gvkey are present in the FOG data
+testdf <- right_join(fogdf, testdf, by = c("CIK","periodyear"))
+testdf <- testdf %>%
+  mutate_if(is.numeric, funs(replace(., !is.finite(.), 0)))
+
+#Combine sentiment and testing using CIK and period year by right-join because not all Gvkey are present in the sentiment data
+testdf <- right_join(sentidf, testdf, by = c("CIK","periodyear"))
+testdf <- testdf %>%
+  mutate_if(is.numeric, funs(replace(., !is.finite(.), 0)))
+
+
+#combine compustat and test by inner join
+test_combined <- inner_join(ext_data, testdf, by = c("gvkey","periodyear"))
+df6 <- distinct(test_combined, gvkey)
+
+test_combined <- test_combined %>% mutate(percent_new=0)
+
+```
+
+EDA after combining all the external data
+```{R Step 12, eval=TRUE}
+
+#Boxplot of Costat against Percent_new including outliers
+ggplot(data = train_combined, aes(y = percent_new, x = costat, fill = costat)) + geom_boxplot()
+
+#Boxplot of Costat against Percent_new excluding outliers
+ggplot(data = train_combined, aes(y = percent_new, x = costat, fill = costat)) + geom_boxplot(outlier.shape = NA) + 
+  scale_y_continuous(limits = quantile(train_combined$percent_new, c(0.1, 0.9)))
+
+#Boxplot of Mkt Valuation against Percent_new including outliers
+ggplot(data = train_combined, aes(y = percent_new, x = mkvaltI, fill = mkvaltI)) + geom_boxplot()
+
+#Boxplot of Mkt valuation against Percent_new excluding outliers
+ggplot(data = train_combined, aes(y = percent_new, x = mkvaltI, fill = mkvaltI)) + geom_boxplot(outlier.shape = NA) + 
+  scale_y_continuous(limits = quantile(train_combined$percent_new, c(0.1, 0.9))) 
+
+#Boxplot of Auditors against Percent_new including outliers
+ggplot(data = train_combined, aes(y = percent_new, x = auI, fill = auI)) + geom_boxplot()
+
+#Boxplot of Auditors against Percent_new excluding outliers
+ggplot(data = train_combined, aes(y = percent_new, x = auI, fill = auI)) + geom_boxplot(outlier.shape = NA) + 
+  scale_y_continuous(limits = quantile(train_combined$percent_new, c(0.1, 0.9)))
+
+#Boxplot of Auditor Opinion against Percent_new including outliers
+ggplot(data = train_combined, aes(y = percent_new, x = auopI, fill = auopI)) + geom_boxplot()
+
+#Boxplot of Auditor Opinion against Percent_new excluding outliers
+ggplot(data = train_combined, aes(y = percent_new, x = auopI, fill = auopI)) + geom_boxplot(outlier.shape = NA) + 
+  scale_y_continuous(limits = quantile(train_combined$percent_new, c(0.1, 0.9)))
+
+```
+
+Drop columns that we do not want from the combined data for both training and testing
+```{R Step 13, eval=TRUE}
+
+cols.dont.want <- c("stalt","apdedate","datadate","fyear","indfmt","consol", "popsrc","datafmt","acctchg","acqmeth","curcd","fdate","pdate","acchg","aqp","at","csho","gdwl","gp","gwo","lt","ni","nopi","pvt","revt","seta","setp","siv","teq","tie","wda","wdp","mkvalt","au","auop","sic","periodyear","CIK", "abc","document","Company", "filing_date","period_date", "Filename","X","file","ebit","ebitda","rcp","xint")
+
+train <- train_combined[, ! names(train_combined) %in% cols.dont.want, drop = F]
+
+test <- test_combined[, ! names(test_combined) %in% cols.dont.want, drop = F]
+
+```
+
+Correleation Heatmap
+```{R Step 14, eval=TRUE}
+
+com <- train[,c("percent_new","acqcshi","do","donr","dvt","rca","percent_change_at","percent_change_csho",
+                        "percent_change_do","percent_change_gdwl","percent_change_gp","percent_change_lt","percent_change_ni",
+                        "percent_change_nopi","percent_change_revt","percent_change_seta","percent_change_siv",
+                        "percent_change_teq","percent_change_wda","con_total","lit_total","neg_total","pos_total",
+                        "sup_total",
+                        "uncertain_total","percent_con_total","percent_lit_total","percent_neg_total",
+                        "percent_pos_total","percent_sup_total","percent_uncertain_total","FOG",
+                        "percent_change_fog"
+                        )]
+cc <- cor(com, method = "spearman")
+library(corrplot)
+corrplot(cc, tl.col = "black", addrect = 4, tl.cex = 0.7)
+
+```
+
+Further drop highly correlated columns: "con_total","lit_total","neg_total","pos_total","sup_total", "uncertain_total","percent_change_teq","percent_change_revt","percent_change_lt","donr"
+```{R Step 15, eval=TRUE}
+cols.dont.want1 <- c("con_total","lit_total","neg_total","pos_total","sup_total",
+                        "uncertain_total","percent_change_teq","percent_change_revt","percent_change_lt","donr")
+
+train1 <- train[, ! names(train) %in% cols.dont.want1, drop = F]
+
+test1 <- test[, ! names(test) %in% cols.dont.want1, drop = F]
+
+```
+
+Split training data feature and target and further split feature into numerical and character type
+```{R Step 16, eval=TRUE}
+
+train_feature <- select(train1, -percent_new)
+train_target <- train1[,ncol(train1)]
+
+# Remove gvkey and gsector from scaling
+df30 <- select(train_feature, "gvkey", "gsector")
+train_feature1 <- select(train_feature, -"gvkey", -"gsector")
+
+train_num_cols <- unlist(lapply(train_feature1, is.numeric))
+train_data_num <- train_feature1[ , train_num_cols]
+
+train_char_cols <- unlist(lapply(train_feature1, is.character))
+train_data_char <- train_feature1[ , train_char_cols]
+
+```
+
+Split testing data feature into numerical and character type
+```{R Step 17, eval=TRUE}
+
+test_feature <- select(test1, -percent_new)
+test_target <- test1[,ncol(test1)]
+
+# Remove gvkey and gsector from scaling
+df31 <- select(test_feature, "gvkey", "gsector")
+test_feature1 <- select(test_feature, -"gvkey", -"gsector")
+
+test_num_cols <- unlist(lapply(test_feature1, is.numeric))
+test_data_num <- test_feature1[ , test_num_cols]
+
+test_char_cols <- unlist(lapply(test_feature1, is.character))
+test_data_char <- test_feature1[ , test_char_cols]
+
+```
+
+Scaling numerical value in training data
+```{R Step 18, eval=TRUE}
+train_data_num_scale <- scale(train_data_num)
+
+```
+
+One hot encoding the char variable in training data and combine the scaled and encoded data together
+```{R Step 19, eval=TRUE}
+
+dummy1 <- dummyVars(" ~ costat", data = train_data_char)
+df7 <- data.frame(predict(dummy1, newdata = train_data_char))
+
+dummy2 <- dummyVars(" ~ mkvaltI", data = train_data_char)
+df8 <- data.frame(predict(dummy2, newdata = train_data_char))
+
+dummy3 <- dummyVars(" ~ auI", data = train_data_char)
+df9 <- data.frame(predict(dummy3, newdata = train_data_char))
+
+dummy4 <- dummyVars(" ~ auopI", data = train_data_char)
+df10 <- data.frame(predict(dummy4, newdata = train_data_char))
+
+df11 <- train_data_char %>% mutate("acchgIN" = ifelse(train_data_char$acchgI == "N",1,0))
+
+train_final <- cbind(df30,train_data_num_scale,df7,df8,df9,df10,df11,train_target)
+head(train_final)
+#check that gvkey and gsector is added back to training data after scaling 
+
+train_final <- train_final %>%
+  mutate_if(is.numeric, funs(replace(., !is.finite(.), 0)))
+
+```
+
+
+Scaling numerical value in testing data using the fitted train data
+```{R Step 20, eval=TRUE}
+test_data_num_scale <- scale(test_data_num, center=attr(train_data_num_scale, "scaled:center"), 
+                  scale=attr(train_data_num_scale, "scaled:scale"))
+
+```
+
+One hot encoding the char variable in testing data and combine the scaled and encoded data together
+```{R Step 21, eval=TRUE}
+dummy9 <- dummyVars(" ~ costat", data = test_data_char)
+df15 <- data.frame(predict(dummy9, newdata = test_data_char))
+
+dummy10 <- dummyVars(" ~ mkvaltI", data = test_data_char)
+df16 <- data.frame(predict(dummy10, newdata = test_data_char))
+
+dummy11 <- dummyVars(" ~ auI", data = test_data_char)
+df17 <- data.frame(predict(dummy11, newdata = test_data_char))
+
+dummy12 <- dummyVars(" ~ auopI", data = test_data_char)
+df18 <- data.frame(predict(dummy12, newdata = test_data_char))
+
+df19 <- test_data_char %>% mutate("acchgIN" = ifelse(test_data_char$acchgI == "N",1,0))
+
+test_final <- cbind(df31,test_data_num_scale,df15,df16,df17,df18,df19,test_target)
+head(test_final)
+#check that gvkey and gsector is added back to testing data after scaling
+
+test_final <- test_final %>%
+  mutate_if(is.numeric, funs(replace(., !is.finite(.), 0)))
+
+```
+
+Model 1: Linear Regression
+```{R Step 22, eval=TRUE}
+mod1 <- lm(percent_new ~ acqcshi + do + dvt + rca + factor(costat) + factor(acchgIN) + factor(mkvaltI)+
+                                factor(auI)+factor(auopI)+
+                                percent_change_at + percent_change_csho + percent_change_do + percent_change_gdwl +
+                                percent_change_gp + percent_change_ni + percent_change_nopi + 
+                                percent_change_seta + percent_change_siv + 
+                                percent_change_wda + FOG + percent_change_fog + percent_con_total + percent_lit_total +
+                                percent_neg_total + percent_pos_total +
+                                percent_sup_total + percent_uncertain_total + factor(gvkey) + factor(gsector),
+                               data = train_final)
+
+summary(mod1)
+
+```
+
+Extract significant coef to run LM again
+```{R Step 23, eval=TRUE}
+aa <- data.frame(summary(mod1)$coefficients)
+colnames(aa) <- c("coef","stderr","tvalue","pvalue")
+
+aa <- aa %>% select(coef,pvalue)
+cc <- as.numeric(aa$pvalue)
+
+bb <- filter(aa,pvalue<0.05)
+bb
+
+```
+
+Model 2: Linear Regression with significant variables
+```{R Step 24, eval=TRUE}
+
+mod2 <- lm(percent_new ~ acqcshi  + dvt+ percent_change_at + FOG + percent_change_fog +percent_change_do +
+             percent_neg_total + factor(mkvaltI)+ factor(auI)+factor(auopI)+
+             percent_uncertain_total + factor(gvkey==1718)+ factor(gvkey==2061) + factor(gvkey==2101) + 
+             factor(gvkey==2435)+ factor(gvkey==2484)+ factor(gvkey==3007)+ factor(gvkey==3813)+ factor(gvkey==4016)+ 
+             factor(gvkey==4321)+factor(gvkey==4415)+ 
+             factor(gvkey==4903)+ 
+             factor(gvkey==5811)+ factor(gvkey==6266)+  factor(gvkey==10692)+ 
+             factor(gvkey==11259)+ factor(gvkey==11499)+ factor(gvkey==12065)+ factor(gvkey==12304)+
+             factor(gvkey==14112) + factor(gvkey==14150)+ factor(gvkey==14256)+ factor(gvkey==14983)+ 
+             factor(gvkey==21241)+
+             factor(gvkey==22495)+ factor(gvkey==23940)+ factor(gvkey==25845)+ factor(gvkey==25969)+ factor(gvkey==27939)+
+             factor(gvkey==28285)+ factor(gvkey==28806)+ factor(gvkey==29609)+ factor(gvkey==31234)+ factor(gvkey==31419)+ 
+             factor(gvkey==31521)+factor(gvkey==61766)+
+             factor(gvkey==63026)+ factor(gvkey==63383)+ factor(gvkey==63448)+ factor(gvkey==64630)+ factor(gvkey==66228)+
+             factor(gvkey==66592)+ factor(gvkey==113090)+ factor(gvkey==122202)+ factor(gvkey==122229)+ factor(gvkey==127077)+
+             factor(gvkey==143640)+ factor(gvkey==146670)+ factor(gvkey==147505)+ factor(gvkey==155913)+
+             factor(gvkey==161088)+ factor(gvkey==161897)+ factor(gvkey==162907)+ factor(gvkey==162941)+ factor(gvkey==163596)+
+             factor(gvkey==164255)+ factor(gvkey==165123)+ factor(gvkey==166430)+ factor(gvkey==165471)+factor(gvkey==166491)+
+             factor(gvkey==166789)+ factor(gvkey==174282)+ factor(gvkey==174355)+ factor(gvkey==174432)+ factor(gvkey==176083)+
+             factor(gvkey==176369)+ factor(gvkey==176554)+ factor(gvkey==176756)+ factor(gvkey==177182)+ factor(gvkey==177599)+
+             factor(gvkey==177734)+ factor(gvkey==178152)+ factor(gvkey==178303)+  factor(gvkey==178513)+factor(gvkey==178939)+ 
+             factor(gvkey==179204)+
+             factor(gvkey==179342)+ factor(gvkey==179413)+ factor(gvkey==179447)+ factor(gvkey==179526)+ factor(gvkey==179543)+
+             factor(gvkey==180007)+ factor(gvkey==180194)+ factor(gvkey==180695)+ factor(gvkey==181036)+
+             factor(gvkey==183591)+ factor(gvkey==183932)+ factor(gvkey==184281)+ 
+             factor(gvkey==185807)+factor(gvkey==272699)+factor(gvkey==187349)+factor(gvkey),
+             data = train_final)
+
+summary(mod2)
+
+```
+
+Finding RMSE for Linear Regression Mod1 and Mod2
+```{R Step 25, eval=TRUE}
+# Mod1 RSS
+lr1_train_RSS <- c(crossprod(mod1$residuals))
+# Mod1 MSE
+lr1_train_MSE <- lr1_train_RSS / length(mod1$residuals)
+# Mod1 RMSE
+lr1_train_RMSE <- sqrt(lr1_train_MSE)
+
+print(paste('LR RMSE Mod1 on training set:', lr1_train_RMSE))
+
+# Mod2 RSS
+lr2_train_RSS <- c(crossprod(mod2$residuals))
+# Mod2 MSE
+lr2_train_MSE <- lr2_train_RSS / length(mod2$residuals)
+# Mod2 RMSE
+lr2_train_RMSE <- sqrt(lr2_train_MSE)
+
+print(paste('LR RMSE Mod2 on training set:', lr2_train_RMSE))
+
+```
+
+Predict LM model 1 on Test Data
+```{R Step 26, eval=TRUE}
+test_final$percent_new <- predict(mod1, test_final)
+
+sum(is.na(test_final$percent_new))
+
+write.csv(test_final[,c("gvkey","percent_new")],"LM1.csv", row.names=FALSE)
+
+```
+
+Predict LM model 2 on Test Data
+```{R Step 27, eval=TRUE}
+test_final$percent_new <- predict(mod2, test_final)
+
+sum(is.na(test_final$percent_new))
+
+write.csv(test_final[,c("gvkey","percent_new")],"LM2.csv", row.names=FALSE)
+
+```
+
+Model 2: Lasso Model
+```{R Step 28, eval=TRUE}
+eq <- as.formula("percent_new ~ acqcshi  + dvt + percent_change_at + FOG + percent_change_fog + percent_change_do +
+             percent_neg_total + factor(mkvaltI) + factor(auI) + factor(auopI) +
+             percent_uncertain_total + factor(gvkey==1718) + factor(gvkey==2061) + factor(gvkey==2101) + 
+             factor(gvkey==2435)+ factor(gvkey==2484)+ factor(gvkey==3007)+ factor(gvkey==3813)+ factor(gvkey==4016)+ 
+             factor(gvkey==4321)+factor(gvkey==4415)+ 
+             factor(gvkey==4903)+ 
+             factor(gvkey==5811)+ factor(gvkey==6266)+  factor(gvkey==10692)+ 
+             factor(gvkey==11259)+ factor(gvkey==11499)+ factor(gvkey==12065)+ factor(gvkey==12304)+
+             factor(gvkey==14112) + factor(gvkey==14150)+ factor(gvkey==14256)+ factor(gvkey==14983)+ 
+             factor(gvkey==21241)+
+             factor(gvkey==22495)+ factor(gvkey==23940)+ factor(gvkey==25845)+ factor(gvkey==25969)+ factor(gvkey==27939)+
+             factor(gvkey==28285)+ factor(gvkey==28806)+ factor(gvkey==29609)+ factor(gvkey==31234)+ factor(gvkey==31419)+ 
+             factor(gvkey==31521)+factor(gvkey==61766)+
+             factor(gvkey==63026)+ factor(gvkey==63383)+ factor(gvkey==63448)+ factor(gvkey==64630)+ factor(gvkey==66228)+
+             factor(gvkey==66592)+ factor(gvkey==113090)+ factor(gvkey==122202)+ factor(gvkey==122229)+ factor(gvkey==127077)+
+             factor(gvkey==143640)+ factor(gvkey==146670)+ factor(gvkey==147505)+ factor(gvkey==155913)+
+             factor(gvkey==161088)+ factor(gvkey==161897)+ factor(gvkey==162907)+ factor(gvkey==162941)+      factor(gvkey==163596)+
+             factor(gvkey==164255)+ factor(gvkey==165123)+ factor(gvkey==166430)+ factor(gvkey==165471)+factor(gvkey==166491)+
+             factor(gvkey==166789)+ factor(gvkey==174282)+ factor(gvkey==174355)+ factor(gvkey==174432)+ factor(gvkey==176083)+
+             factor(gvkey==176369)+ factor(gvkey==176554)+ factor(gvkey==176756)+ factor(gvkey==177182)+ factor(gvkey==177599)+
+             factor(gvkey==177734)+ factor(gvkey==178152)+ factor(gvkey==178303)+  factor(gvkey==178513)+factor(gvkey==178939)+ 
+             factor(gvkey==179204)+
+             factor(gvkey==179342)+ factor(gvkey==179413)+ factor(gvkey==179447)+ factor(gvkey==179526)+ factor(gvkey==179543)+
+             factor(gvkey==180007)+ factor(gvkey==180194)+ factor(gvkey==180695)+ factor(gvkey==181036)+
+             factor(gvkey==183591)+ factor(gvkey==183932)+ factor(gvkey==184281)+ 
+             factor(gvkey==185807)+factor(gvkey==272699)+factor(gvkey==187349)+factor(gvkey)-1")
+
+```
+
+
+```{R Step 29, eval=TRUE}
+# Construct matrices for running the LASSO
+x <- model.matrix(eq, data = train_final)[,-1]
+y <- model.frame(eq, data = train_final)[ , "percent_new"]
+
+set.seed(2021) #for reproducibility
+cvfit = cv.glmnet(x = x, y = y,family = "gaussian", alpha = 1,
+                  type.measure = "mse")
+
+coef(cvfit, s = "lambda.min")
+
+coefplot(cvfit, lambda = 'lambda.min', sort = 'magnitude')
+
+```
+
+Finding RMSE for Lasso Model
+```{R Step 30, eval=TRUE}
+# prediction for the training set
+ls_pred_train_y <- predict(cvfit, x, type = "response", s = "lambda.min")
+
+# calculate lasso rmse on training set
+ls_train_RMSE <- rmse(ls_pred_train_y, y)
+print(paste('LS RMSE on training set:', ls_train_RMSE))
+
+```
+
+```{R Step 31, eval=TRUE}
+# Make matrices for test data
+xtest <- model.matrix(eq, data = test_final)[,-1]
+ytest <- model.frame(eq, data = test_final)[ , "percent_new"]
+
+# Make predictions on test data
+test_final$percent_new  <- predict(cvfit, xtest, type = "response", s = "lambda.min")
+
+sum(is.na(test_final$percent_new))
+
+write.csv(test_final[,c("gvkey","percent_new")],"Lasso.csv", row.names=FALSE)
+
+coefpath(cvfit)
+
+```
+
+Model 3: XSGBoost model
+
+Split training data into training and validation data to test for over and under fitting later on
+```{R Step 32, eval=TRUE}
+# 80% of the sample size
+sample_size <- floor(0.80 * nrow(train1))
+
+# set the seed to make your partition reproducible
+set.seed(168)
+train_ind <- sample(seq_len(nrow(train1)), size = sample_size)
+
+train2 <- train1[train_ind, ]
+val <- train1[-train_ind, ]
+
+```
+
+Split training data feature and target and further split feature into numerical and character type
+```{R Step 33, eval=TRUE}
+# Seperate features and target for train2
+train_feature <- select(train2, -percent_new)
+train_target <- train2[,ncol(train2)]
+
+# Remove gvkey and gsector from scaling
+df32 <- select(train_feature, "gvkey", "gsector")
+train_feature1 <- select(train_feature, -"gvkey", -"gsector")
+
+train_num_cols <- unlist(lapply(train_feature1, is.numeric))
+train_data_num <- train_feature1[ , train_num_cols]
+
+train_char_cols <- unlist(lapply(train_feature1, is.character))
+train_data_char <- train_feature1[ , train_char_cols]
+
+```
+
+Scaling numerical value in training data
+```{R Step 34, eval=TRUE}
+# Scaling the num variables mean = 0, std dev = 1
+train_data_num_scale <- scale(train_data_num)
+
+```
+
+One hot encoding the char variable in training data and combine the scaled and encoded data together
+```{R Step 35, eval=TRUE}
+dummy1 <- dummyVars(" ~ costat", data = train_data_char)
+df7 <- data.frame(predict(dummy1, newdata = train_data_char))
+
+dummy2 <- dummyVars(" ~ mkvaltI", data = train_data_char)
+df8 <- data.frame(predict(dummy2, newdata = train_data_char))
+
+dummy3 <- dummyVars(" ~ auI", data = train_data_char)
+df9 <- data.frame(predict(dummy3, newdata = train_data_char))
+
+dummy4 <- dummyVars(" ~ auopI", data = train_data_char)
+df10 <- data.frame(predict(dummy4, newdata = train_data_char))
+
+df11 <- train_data_char %>% mutate("acchgIN" = ifelse(train_data_char$acchgI == "N",1,0))
+
+train_final <- cbind(df32,train_data_num_scale,df7,df8,df9,df10,df11,train_target)
+head(train_final)
+
+train_final <- train_final %>%
+  mutate_if(is.numeric, funs(replace(., !is.finite(.), 0)))
+
+```
+
+Split validation data feature and target and further split feature into numerical and character type
+```{R Step 36, eval=TRUE}
+# Seperate features and target for val
+val_feature <- select(val, -percent_new)
+val_target <- val[,ncol(val)]
+
+# Remove gvkey and gsector from scaling
+df33 <- select(val_feature, "gvkey", "gsector")
+val_feature1 <- select(val_feature, -"gvkey", -"gsector")
+
+val_num_cols <- unlist(lapply(val_feature1, is.numeric))
+val_data_num <- val_feature1[ , val_num_cols]
+
+val_char_cols <- unlist(lapply(val_feature1, is.character))
+val_data_char <- val_feature1[ , val_char_cols]
+
+```
+
+Scaling numerical value in validation data
+```{R Step 37, eval=TRUE}
+# Transform val using the fitted train data
+val_data_num_scale <- scale(val_data_num, center=attr(train_data_num_scale, "scaled:center"), 
+                           scale=attr(train_data_num_scale, "scaled:scale"))
+
+```
+
+One hot encoding the char variable in validation data and combine the scaled and encoded data together
+```{R Step 38, eval=TRUE}
+# One hot encoding the char variable for val
+dummy5 <- dummyVars(" ~ costat", data = val_data_char)
+df12 <- data.frame(predict(dummy5, newdata = val_data_char))
+
+dummy6 <- dummyVars(" ~ mkvaltI", data = val_data_char)
+df13 <- data.frame(predict(dummy6, newdata = val_data_char))
+
+dummy7 <- dummyVars(" ~ auI", data = val_data_char)
+df14 <- data.frame(predict(dummy7, newdata = val_data_char))
+
+dummy8 <- dummyVars(" ~ auopI", data = val_data_char)
+df15 <- data.frame(predict(dummy8, newdata = val_data_char))
+
+df16 <- val_data_char %>% mutate("acchgIN" = ifelse(val_data_char$acchgI == "N",1,0))
+
+val_final <- cbind(df33,val_data_num_scale,df12,df13,df14,df15,df16,val_target)
+head(val_final)
+
+val_final <- val_final %>%
+  mutate_if(is.numeric, funs(replace(., !is.finite(.), 0)))
+
+```
+
+Scaling numerical value in testing data
+```{R Step 39, eval=TRUE}
+# Transform test using the fitted train data
+test_data_num_scale <- scale(test_data_num, center=attr(train_data_num_scale, "scaled:center"), 
+                  scale=attr(train_data_num_scale, "scaled:scale"))
+
+```
+
+```{R Step 40, eval=TRUE}
+# One hot encoding the char variable for test
+dummy9 <- dummyVars(" ~ costat", data = test_data_char)
+df17 <- data.frame(predict(dummy9, newdata = test_data_char))
+
+dummy10 <- dummyVars(" ~ mkvaltI", data = test_data_char)
+df18 <- data.frame(predict(dummy10, newdata = test_data_char))
+
+dummy11 <- dummyVars(" ~ auI", data = test_data_char)
+df19 <- data.frame(predict(dummy11, newdata = test_data_char))
+
+dummy12 <- dummyVars(" ~ auopI", data = test_data_char)
+df20 <- data.frame(predict(dummy12, newdata = test_data_char))
+
+df21 <- test_data_char %>% mutate("acchgIN" = ifelse(test_data_char$acchgI == "N",1,0))
+
+test_final <- cbind(df31,test_data_num_scale,df17,df18,df19,df20,df21)
+head(test_final)
+
+test_final <- test_final %>%
+  mutate_if(is.numeric, funs(replace(., !is.finite(.), 0)))
+
+```
+
+Running XGBoost
+```{R Step 41, eval=TRUE}
+# XGBoost Model fitted on train
+train_x <- data.matrix(train_final[, -42])
+
+train_y <- train_final[,42]
+
+xgb_train <- xgb.DMatrix(data = train_x, label = train_y)
+
+xgb_model <- xgboost(data = xgb_train, max.depth = 7, nrounds = 100)
+
+print(xgb_model)
+
+```
+
+```{R Step 42, eval=TRUE}
+# XGBoost Model predicted on val
+val_x <- data.matrix(val_final[, -42])
+
+val_y <- val_final[,42]
+
+xgb_val <- xgb.DMatrix(data = val_x, label = val_y)
+
+pred_val_y <- predict(xgb_model, xgb_val)
+
+xgb_val_rmse <- caret::RMSE(val_y, pred_val_y)
+
+# plot val predict vs orginal
+x = 1:length(val_y)
+plot(x, val_y, col = "red", type = "l")
+lines(x, pred_val_y, col = "blue", type = "l")
+legend(x = 50, y = 0.8,  legend = c("original val_y", "predicted val_y"), 
+       col = c("red", "blue"), box.lty = 1, cex = 0.8, lty = c(1, 1))
+
+```
+
+```{R Step 43, eval=TRUE}
+# XGBoost model predicted on train
+pred_train_y <- predict(xgb_model, xgb_train)
+
+xgb_train_rmse <- caret::RMSE(train_y, pred_train_y)
+
+# calculate XGB rmse on training and validation set
+print(paste('XGB RMSE on training set:', xgb_train_rmse))
+print(paste('XGB RMSE on validation set:', xgb_val_rmse))
+
+# XGBoost Model predicted on test
+test_x <- data.matrix(test_final)
+
+xgb_test <- xgb.DMatrix(data = test_x)
+
+test_final$percent_new <- predict(xgb_model, xgb_test)
+
+sum(is.na(test_final$percent_new))
+
+write.csv(test_final[,c("gvkey","percent_new")],"XGBoost.csv", row.names=FALSE)
+
+```
+
+To plot XGB relative importance of variables
+```{R Step 44, eval=TRUE}
+col_names <- attr(xgb_train, ".Dimnames")[[2]]
+imp <- xgb.importance(col_names, xgb_model)
+
+xgb.plot.importance(imp)
+
+```
+
+Ensemble Method for all 3 selected model
+```{R Step 45, eval=TRUE}
+#Taking average of RMSE
+train_rmse_avg <- (lr1_train_RMSE + lr2_train_RMSE + ls_train_RMSE +
+                     xgb_train_rmse) / 4
+
+#Taking weighted average of RMSE
+train_rmse_weighted_avg <- 
+  (lr1_train_RMSE * 0.1) + (lr2_train_RMSE * 0.1) + (ls_train_RMSE * 0.1) +
+  (xgb_train_rmse * 0.7)
+
+print(paste('Average of RMSE:', train_rmse_avg))
+print(paste('Weighted average of RMSE:', train_rmse_weighted_avg))
+
+```
+
+Output ensemble prediction 
+```{R Step 46, eval=TRUE}
+elm1 <- read.csv("LM1.csv")
+elm2 <- read.csv("LM2.csv")
+els <- read.csv("Lasso.csv")
+exgb <- read.csv("XGBoost.csv")
+
+e1 <- inner_join(elm1,elm2, by = 'gvkey')
+e2 <- inner_join(e1,els, by = 'gvkey')
+epred = inner_join(e2,exgb, by = 'gvkey')
+
+epred <- epred %>% mutate(w1 = percent_new.x * 0.1)
+epred <- epred %>% mutate(w2 = percent_new.y * 0.1)
+epred <- epred %>% mutate(w3 = percent_new.x.x * 0.1)
+epred <- epred %>% mutate(w4 = percent_new.y.y * 0.7)
+epred <- epred %>% mutate(percent_new = w1 + w2 + w3 + w4)
+  
+write.csv(epred[,c("gvkey","percent_new")],"Ensemble.csv", row.names=FALSE)
+
+```
