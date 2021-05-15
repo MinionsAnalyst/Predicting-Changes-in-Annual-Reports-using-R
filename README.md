@@ -10,20 +10,20 @@ The project seeks to create a model that will be able to identify signals that p
 
 •	Sentiment analysis
 
-Key findings from EDA
+**Key findings from EDA**
 1)	Active / Dormant Companies - inactive companies have slightly higher median and quartiles of changes in annual reports.
 2)	Market Valuation - companies with higher market capitalisations tend to have more boilerplate disclosures.
 3)	Auditors and Audit Opinion - companies with Big Four and Mid Tier auditors have a lower median and quartiles of changes in annual reports.
 
-Machine Learning Models
+**Machine Learning Models**
 1) Linear Regression
 2) Lasso Regression
 3) XGBoost
 
-Evaluation of models
+**Evaluation of models**
 
 Our XGBoost is the best performing model with a Kaggle RMSE Score of 0.05027 (5th out of 19 teams) 
 
-Further consideration
+**Further consideration**
 
 More external data sources such as external GDP, share price movements or industry specific indices can be included to train the model to provide a better RMSE score.
