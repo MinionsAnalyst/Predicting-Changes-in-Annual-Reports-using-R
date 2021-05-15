@@ -5,7 +5,9 @@ This project is hosted by the Kaggle private competition and the dataset will no
 The project seeks to create a model that will be able to identify signals that predict what percentage of change year-on-year there is in a company’s annual report and we had to gather our features first with huge autonomy and flexibility in terms of what to include. We ultimately settled upon 3 sources.
 
 •	Compustat (financial ratios)
+
 •	Fog (readability)
+
 •	Sentiment analysis
 
 Key findings from EDA
